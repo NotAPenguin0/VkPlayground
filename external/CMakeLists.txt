@@ -1,0 +1,14 @@
+add_subdirectory("glfw")
+
+
+set(VK_PLAYGROUND_LINK_LIBRARIES
+    ${VK_PLAYGROUND_LINK_LIBRARIES}
+    glfw
+    PARENT_SCOPE
+)
+
+set(VK_PLAYGROUND_INCLUDE_DIRS 
+    ${VK_PLAYGROUND_INCLUDE_DIRS}
+    "${CMAKE_CURRENT_SOURCE_DIR}/glfw/include"
+    PARENT_SCOPE
+)
