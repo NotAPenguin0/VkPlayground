@@ -10,6 +10,8 @@
 #include <optional>
 #include <vector>
 
+constexpr size_t max_frames_in_flight = 2;
+
 static std::string read_file(std::string_view fname) {
     std::ifstream file(fname.data(), std::ios::binary);
     return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
@@ -223,12 +225,16 @@ public:
         create_framebuffers();
         create_command_pool();
         create_command_buffers();
-        create_semaphores();
+        create_sync_objects();
     }
 
     ~VulkanApp() {
-        device.destroySemaphore(semaphores.image_available);
-        device.destroySemaphore(semaphores.render_finished);
+        for (auto& sync_set : sync_objects) {
+            device.destroySemaphore(sync_set.image_available);
+            device.destroySemaphore(sync_set.render_finished);
+            device.destroyFence(sync_set.frame_fence);
+        }
+
         device.destroyCommandPool(command_pool);
         for (auto const& framebuf : swapchain_framebuffers) {
             device.destroyFramebuffer(framebuf);
@@ -253,7 +259,11 @@ public:
         while(!glfwWindowShouldClose(window)) {
             glfwPollEvents();
             render_frame();
+            current_frame = (current_frame + 1) % max_frames_in_flight;
         }
+        
+        // Wait until everything is done before starting to deallocate stuff
+        device.waitIdle();
     }
 
 private:
@@ -287,11 +297,17 @@ private:
     vk::CommandPool command_pool;
     std::vector<vk::CommandBuffer> command_buffers;
 
+    size_t current_frame = 0;
+
     // Synchronization
-    struct Semaphores {
+    struct SyncObjects {
         vk::Semaphore image_available;
         vk::Semaphore render_finished;
-    } semaphores;
+        vk::Fence frame_fence;
+    };
+
+    std::vector<SyncObjects> sync_objects;
+    std::vector<vk::Fence> images_in_flight;
 
     void get_available_instance_extensions() {
         extensions = vk::enumerateInstanceExtensionProperties();
@@ -742,24 +758,44 @@ private:
         }
     }
 
-    void create_semaphores() {
+    void create_sync_objects() {
         vk::SemaphoreCreateInfo info;
-        semaphores.image_available = device.createSemaphore(info);
-        semaphores.render_finished = device.createSemaphore(info);
+        vk::FenceCreateInfo fence_info;
+        fence_info.flags = vk::FenceCreateFlagBits::eSignaled;
+        sync_objects.resize(max_frames_in_flight);
+        for (auto& sync_set : sync_objects) {
+            sync_set.image_available = device.createSemaphore(info);
+            sync_set.render_finished = device.createSemaphore(info);
+            sync_set.frame_fence = device.createFence(fence_info);
+        }
+
+        images_in_flight.resize(swapchain_images.size(), nullptr);
     }
 
     void render_frame() {
+        // Wait for an available spot in the in-flight frames array
+        device.waitForFences(sync_objects[current_frame].frame_fence, true, std::numeric_limits<std::uint64_t>::max());
+
+
         // 1. Get image from swapchain for rendering
         // 2. Execute the correct command buffer to render to this image
         // 3. Send it back to the swapchain for presenting
 
         // Step 1: Aqcuire image from swapchain
         std::uint32_t image_index = device.acquireNextImageKHR(swapchain, std::numeric_limits<std::uint64_t>::max(), 
-                                                               semaphores.image_available, nullptr).value;
+                                                               sync_objects[current_frame].image_available, nullptr).value;
+        // Check if a previous frame is using this image
+        if (images_in_flight[image_index]) {
+            device.waitForFences(images_in_flight[image_index], true, std::numeric_limits<std::uint64_t>::max());
+        }
+
+        // Mark this image in use by the current frame
+        images_in_flight[image_index] = sync_objects[current_frame].frame_fence;
+
         // Step 2: Submit command buffer
         vk::SubmitInfo submit_info;
         // These are the semaphores we want to wait for
-        vk::Semaphore wait_semaphores[] = { semaphores.image_available };
+        vk::Semaphore wait_semaphores[] = { sync_objects[current_frame].image_available };
         // At what stage we need to start waiting for the image. This means we can already start running the vertex shader
         // even if the image is not available yet.
         vk::PipelineStageFlags wait_stages[] = { vk::PipelineStageFlagBits::eColorAttachmentOutput };
@@ -772,12 +808,15 @@ private:
         submit_info.pCommandBuffers = &command_buffers[image_index];
         
         // Specify the semaphores to signal when the operation is done
-        vk::Semaphore signal_semaphores[] = { semaphores.render_finished };
+        vk::Semaphore signal_semaphores[] = { sync_objects[current_frame].render_finished };
         submit_info.signalSemaphoreCount = 1;
         submit_info.pSignalSemaphores = signal_semaphores;
         
+        // Reset the fence right before we actually need to use it
+        device.resetFences(sync_objects[current_frame].frame_fence);
+
         // Submit the command buffer
-        graphics_queue.submit(submit_info, nullptr);
+        graphics_queue.submit(submit_info, sync_objects[current_frame].frame_fence);
 
         // Step 3: Present to the swapchain
         vk::PresentInfoKHR present_info;
