@@ -4,10 +4,16 @@
 #undef max
 #undef min
 
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <optional>
 #include <vector>
+
+static std::string read_file(std::string_view fname) {
+    std::ifstream file(fname.data(), std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+}
 
 static GLFWwindow* init_glfw(size_t w, size_t h, const char* title) {
     glfwInit();
@@ -135,8 +141,10 @@ static vk::Extent2D choose_swap_extent(vk::SurfaceCapabilitiesKHR const& capabil
 
     vk::Extent2D actual_extent = vk::Extent2D(window_w, window_h);
 
-    actual_extent.width = std::max(capabilities.minImageExtent.width, std::min(capabilities.maxImageExtent.width, actual_extent.width));
-    actual_extent.height = std::max(capabilities.minImageExtent.height, std::min(capabilities.maxImageExtent.height, actual_extent.height));
+    actual_extent.width = std::max(capabilities.minImageExtent.width, 
+                                   std::min(capabilities.maxImageExtent.width, actual_extent.width));
+    actual_extent.height = std::max(capabilities.minImageExtent.height, 
+                                    std::min(capabilities.maxImageExtent.height, actual_extent.height));
 
     return actual_extent;
 }
@@ -209,9 +217,29 @@ public:
         pick_physical_device();
         create_logical_device();
         create_swapchain();
+        create_image_views();
+        create_render_pass();
+        create_graphics_pipeline();
+        create_framebuffers();
+        create_command_pool();
+        create_command_buffers();
+        create_semaphores();
     }
 
     ~VulkanApp() {
+        device.destroySemaphore(semaphores.image_available);
+        device.destroySemaphore(semaphores.render_finished);
+        device.destroyCommandPool(command_pool);
+        for (auto const& framebuf : swapchain_framebuffers) {
+            device.destroyFramebuffer(framebuf);
+        }
+
+        for (auto const& img_view : swapchain_image_views) {
+            device.destroyImageView(img_view);
+        }
+        device.destroyPipeline(graphics_pipeline);
+        device.destroyRenderPass(render_pass);
+        device.destroyPipelineLayout(pipeline_layout);
         device.destroySwapchainKHR(swapchain);
         device.destroy();
         instance.destroyDebugUtilsMessengerEXT(debug_messenger, nullptr, dynamic_dispatcher);
@@ -224,6 +252,7 @@ public:
     void run() {
         while(!glfwWindowShouldClose(window)) {
             glfwPollEvents();
+            render_frame();
         }
     }
 
@@ -245,8 +274,24 @@ private:
     vk::SwapchainKHR swapchain;
 
     std::vector<vk::Image> swapchain_images;
+    std::vector<vk::ImageView> swapchain_image_views;
     vk::Format swapchain_format;
     vk::Extent2D swapchain_extent;
+
+    vk::PipelineLayout pipeline_layout;
+    vk::RenderPass render_pass;
+    vk::Pipeline graphics_pipeline;
+
+    std::vector<vk::Framebuffer> swapchain_framebuffers;
+
+    vk::CommandPool command_pool;
+    std::vector<vk::CommandBuffer> command_buffers;
+
+    // Synchronization
+    struct Semaphores {
+        vk::Semaphore image_available;
+        vk::Semaphore render_finished;
+    } semaphores;
 
     void get_available_instance_extensions() {
         extensions = vk::enumerateInstanceExtensionProperties();
@@ -437,6 +482,317 @@ private:
         swapchain_extent = extent;
         swapchain_format = surface_format.format;
         swapchain_images = device.getSwapchainImagesKHR(swapchain);
+    }
+
+    void create_image_views() {
+        swapchain_image_views.resize(swapchain_images.size());
+        for (size_t i = 0; i < swapchain_image_views.size(); ++i) {
+            vk::ImageViewCreateInfo info;
+            info.image = swapchain_images[i];
+            info.viewType = vk::ImageViewType::e2D;
+            info.format = swapchain_format;
+            // Swizzle components (this shit is pretty cool).
+            // Note that Vulkan.hpp has these values as the default anyway, so it's not nessecary to specify them here
+            info.components.r = vk::ComponentSwizzle::eIdentity;
+            info.components.g = vk::ComponentSwizzle::eIdentity;
+            info.components.b = vk::ComponentSwizzle::eIdentity;
+            info.components.a = vk::ComponentSwizzle::eIdentity;
+            // subresourceRange describes what to use the image for
+            info.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+            info.subresourceRange.baseMipLevel = 0;
+            info.subresourceRange.levelCount = 1;
+            info.subresourceRange.baseArrayLayer = 0;
+            info.subresourceRange.layerCount = 1;
+            swapchain_image_views[i] = device.createImageView(info);
+        }
+    }
+
+    vk::ShaderModule create_shader_module(std::string const& code) {
+        vk::ShaderModuleCreateInfo info;
+        info.codeSize = code.size();
+        info.pCode = reinterpret_cast<std::uint32_t const*>(code.data());
+        return device.createShaderModule(info);
+    }
+
+    void create_render_pass() {
+        vk::AttachmentDescription color_attachment;
+        color_attachment.format = swapchain_format;
+        color_attachment.loadOp = vk::AttachmentLoadOp::eClear;
+        color_attachment.storeOp = vk::AttachmentStoreOp::eStore;
+        // We don't care about what happens to the stencil attachment now
+        color_attachment.stencilLoadOp = vk::AttachmentLoadOp::eDontCare;
+        color_attachment.stencilStoreOp = vk::AttachmentStoreOp::eDontCare;
+        
+        color_attachment.initialLayout = vk::ImageLayout::eUndefined;
+        color_attachment.finalLayout = vk::ImageLayout::ePresentSrcKHR;
+
+        // Create a single subpass
+        vk::AttachmentReference color_attachment_ref;
+        color_attachment_ref.attachment = 0;
+        color_attachment_ref.layout = vk::ImageLayout::eColorAttachmentOptimal;
+
+        vk::SubpassDescription subpass_info;
+        subpass_info.pipelineBindPoint = vk::PipelineBindPoint::eGraphics;
+        subpass_info.colorAttachmentCount = 1;
+        subpass_info.pColorAttachments = &color_attachment_ref;
+
+        vk::SubpassDependency dependency;
+        // Create a dependency between the implicit "transform" step before our subpass and our own subpass
+        dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+        dependency.dstSubpass = 0;
+        // Specify where the dependency happens
+        dependency.srcStageMask = vk::PipelineStageFlagBits::eColorAttachmentOutput;
+        dependency.dstStageMask = vk::PipelineStageFlagBits::eColorAttachmentOutput;
+        dependency.dstAccessMask = vk::AccessFlagBits::eColorAttachmentRead | vk::AccessFlagBits::eColorAttachmentWrite;
+
+        // Create the actual render pass
+        vk::RenderPassCreateInfo render_pass_info;
+        render_pass_info.attachmentCount = 1;
+        render_pass_info.pAttachments = &color_attachment;
+        render_pass_info.subpassCount = 1;
+        render_pass_info.pSubpasses = &subpass_info;
+        render_pass_info.dependencyCount = 1;
+        render_pass_info.pDependencies = &dependency;
+
+        render_pass = device.createRenderPass(render_pass_info);
+    }
+
+    void create_graphics_pipeline() {
+        std::string vert_shader_code = read_file("shaders/shader.vert.spv");
+        std::string frag_shader_code = read_file("shaders/shader.frag.spv");
+
+        vk::ShaderModule vert_module = create_shader_module(vert_shader_code);
+        vk::ShaderModule frag_module = create_shader_module(frag_shader_code);
+
+        // For each shader stage, we need a vk::PipelineShaderStage
+        vk::PipelineShaderStageCreateInfo vert_info;
+        vert_info.stage = vk::ShaderStageFlagBits::eVertex;
+        vert_info.module = vert_module;
+        // Specify entry point for shader
+        vert_info.pName = "main";
+
+        vk::PipelineShaderStageCreateInfo frag_info;
+        frag_info.stage = vk::ShaderStageFlagBits::eFragment;
+        frag_info.module = frag_module;
+        frag_info.pName = "main";
+
+        vk::PipelineShaderStageCreateInfo shader_stages[] = { vert_info, frag_info };
+
+        // Similar to OpenGL vao objects
+        vk::PipelineVertexInputStateCreateInfo vertex_input_info;
+        // Since we're hardcoding vertex data in the shader, we will set this up so that there is no info
+        vertex_input_info.vertexBindingDescriptionCount = 0;
+        vertex_input_info.pVertexBindingDescriptions = nullptr;
+        vertex_input_info.vertexAttributeDescriptionCount = 0;
+        vertex_input_info.pVertexAttributeDescriptions = nullptr;
+
+        vk::PipelineInputAssemblyStateCreateInfo input_assembly_info;
+        input_assembly_info.topology = vk::PrimitiveTopology::eTriangleList;
+        input_assembly_info.primitiveRestartEnable = false;
+
+        // Define viewport and scissor region
+        vk::Viewport viewport;
+        viewport.x = 0.0f;
+        viewport.y = 0.0f;
+        viewport.width = swapchain_extent.width;
+        viewport.height = swapchain_extent.height;
+        viewport.minDepth = 0.0f;
+        viewport.maxDepth = 0.0f;
+        vk::Rect2D scissor;
+        scissor.offset = vk::Offset2D{};
+        scissor.extent = swapchain_extent;
+
+        vk::PipelineViewportStateCreateInfo viewport_info;
+        viewport_info.viewportCount = 1;
+        viewport_info.pViewports = &viewport;
+        viewport_info.scissorCount = 1;
+        viewport_info.pScissors = &scissor;
+
+        // Rasterizer create info
+        vk::PipelineRasterizationStateCreateInfo rasterization_info;
+        rasterization_info.depthClampEnable = false;
+        rasterization_info.rasterizerDiscardEnable = false;
+        rasterization_info.polygonMode = vk::PolygonMode::eFill;
+        rasterization_info.lineWidth = 1.0f;
+        rasterization_info.cullMode = vk::CullModeFlagBits::eBack;
+        rasterization_info.frontFace = vk::FrontFace::eClockwise;
+        // This setting can be useful for shadow mapping. Requires additional values to be set.
+        rasterization_info.depthBiasEnable = false;
+
+        // Setup multisample state
+        vk::PipelineMultisampleStateCreateInfo multisample_info;
+        multisample_info.sampleShadingEnable = false;
+        multisample_info.rasterizationSamples = vk::SampleCountFlagBits::e1;
+        // If we were to enable multisampling, we'd need to set a few more settings here
+
+        // Do not enable depth testing for now
+
+        // Setup color blending mode
+        vk::PipelineColorBlendAttachmentState color_blend_attachment;
+        color_blend_attachment.colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG 
+                                        | vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+        color_blend_attachment.blendEnable = false;
+        // Since we disable blending, we can leave the other settings at the default
+
+        vk::PipelineColorBlendStateCreateInfo color_blend_info;
+        color_blend_info.logicOpEnable = false;
+        color_blend_info.attachmentCount = 1;
+        color_blend_info.pAttachments = &color_blend_attachment;
+
+        // Set dynamic state
+        vk::DynamicState dynamic_states[] = {
+            vk::DynamicState::eViewport
+        };
+
+        vk::PipelineDynamicStateCreateInfo dynamic_state_info;
+        dynamic_state_info.dynamicStateCount = 1;
+        dynamic_state_info.pDynamicStates = dynamic_states;
+
+        // The pipeline layout specifies uniforms
+        vk::PipelineLayoutCreateInfo pipeline_layout_info;
+        pipeline_layout = device.createPipelineLayout(pipeline_layout_info);
+
+        // Create the actual graphics pipeline
+        vk::GraphicsPipelineCreateInfo pipeline_info;
+        pipeline_info.stageCount = 2;
+        pipeline_info.pStages = shader_stages;
+        pipeline_info.pVertexInputState = &vertex_input_info;
+        pipeline_info.pInputAssemblyState = &input_assembly_info;
+        pipeline_info.pViewportState = &viewport_info;
+        pipeline_info.pRasterizationState = &rasterization_info;
+        pipeline_info.pMultisampleState = &multisample_info;
+        pipeline_info.pColorBlendState = &color_blend_info;
+        pipeline_info.pDynamicState = nullptr; // Disable dynamic state for now
+        // Setup layout and render pass
+        pipeline_info.layout = pipeline_layout;
+        pipeline_info.renderPass = render_pass;
+        pipeline_info.subpass = 0;
+
+        graphics_pipeline = device.createGraphicsPipeline(nullptr, pipeline_info);
+
+        // Just like with OpenGL shaders, we're allowed to destroy the modules when 
+        // we have finished linking them together
+        device.destroyShaderModule(vert_module);
+        device.destroyShaderModule(frag_module);
+    }
+
+    void create_framebuffers() {
+        swapchain_framebuffers.resize(swapchain_image_views.size());
+        for (size_t i = 0; i < swapchain_framebuffers.size(); ++i) {
+            // We only have one attachment for this framebuffer
+            vk::ImageView attachments[] = {
+                swapchain_image_views[i]
+            };
+
+            vk::FramebufferCreateInfo framebuffer_info;
+            framebuffer_info.renderPass = render_pass;
+            framebuffer_info.attachmentCount = 1;
+            framebuffer_info.pAttachments = attachments;
+            framebuffer_info.width = swapchain_extent.width;
+            framebuffer_info.height = swapchain_extent.height;
+            framebuffer_info.layers = 1;
+
+            swapchain_framebuffers[i] = device.createFramebuffer(framebuffer_info);
+        }
+    }
+
+    void create_command_pool() {
+        QueueFamilyIndices queue_families = find_queue_families(physical_device, surface);
+        vk::CommandPoolCreateInfo info;
+        info.queueFamilyIndex = queue_families.graphics_family.value();
+
+        command_pool = device.createCommandPool(info);
+    }
+
+    void create_command_buffers() {
+        // Create the command buffers
+        vk::CommandBufferAllocateInfo info;
+        info.commandPool = command_pool;
+        info.level = vk::CommandBufferLevel::ePrimary;
+        info.commandBufferCount = swapchain_framebuffers.size();
+
+        command_buffers = device.allocateCommandBuffers(info);
+
+        // Record commands to the command buffers
+        for (size_t i = 0; i < command_buffers.size(); ++i) {
+            vk::CommandBuffer cmd_buffer = command_buffers[i];
+            // We're going to leave these values at their defaults
+            vk::CommandBufferBeginInfo begin_info;
+            // Start command buffer
+            cmd_buffer.begin(begin_info);
+            // Start render pass
+            vk::RenderPassBeginInfo render_pass_info;
+            render_pass_info.renderPass = render_pass;
+            render_pass_info.framebuffer = swapchain_framebuffers[i];
+            render_pass_info.renderArea.offset = vk::Offset2D{0, 0};
+            render_pass_info.renderArea.extent = swapchain_extent;
+            // Specify clear color
+            vk::ClearValue clear_color = vk::ClearColorValue(std::array<float, 4>{{0.0f, 0.0f, 0.0f, 1.0f}});
+            render_pass_info.clearValueCount = 1;
+            render_pass_info.pClearValues = &clear_color;
+            // Render pass started
+            cmd_buffer.beginRenderPass(render_pass_info, vk::SubpassContents::eInline);
+            // Bind the graphics pipeline
+            cmd_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, graphics_pipeline);
+            // Do the drawcall
+            cmd_buffer.draw(3, 1, 0, 0);
+            // End command buffer
+            cmd_buffer.endRenderPass();
+            cmd_buffer.end();
+        }
+    }
+
+    void create_semaphores() {
+        vk::SemaphoreCreateInfo info;
+        semaphores.image_available = device.createSemaphore(info);
+        semaphores.render_finished = device.createSemaphore(info);
+    }
+
+    void render_frame() {
+        // 1. Get image from swapchain for rendering
+        // 2. Execute the correct command buffer to render to this image
+        // 3. Send it back to the swapchain for presenting
+
+        // Step 1: Aqcuire image from swapchain
+        std::uint32_t image_index = device.acquireNextImageKHR(swapchain, std::numeric_limits<std::uint64_t>::max(), 
+                                                               semaphores.image_available, nullptr).value;
+        // Step 2: Submit command buffer
+        vk::SubmitInfo submit_info;
+        // These are the semaphores we want to wait for
+        vk::Semaphore wait_semaphores[] = { semaphores.image_available };
+        // At what stage we need to start waiting for the image. This means we can already start running the vertex shader
+        // even if the image is not available yet.
+        vk::PipelineStageFlags wait_stages[] = { vk::PipelineStageFlagBits::eColorAttachmentOutput };
+        submit_info.waitSemaphoreCount = 1;
+        submit_info.pWaitSemaphores = wait_semaphores;
+        submit_info.pWaitDstStageMask = wait_stages;
+
+        // Specify which command buffers to submit
+        submit_info.commandBufferCount = 1;
+        submit_info.pCommandBuffers = &command_buffers[image_index];
+        
+        // Specify the semaphores to signal when the operation is done
+        vk::Semaphore signal_semaphores[] = { semaphores.render_finished };
+        submit_info.signalSemaphoreCount = 1;
+        submit_info.pSignalSemaphores = signal_semaphores;
+        
+        // Submit the command buffer
+        graphics_queue.submit(submit_info, nullptr);
+
+        // Step 3: Present to the swapchain
+        vk::PresentInfoKHR present_info;
+        // Wait for the render_finished semaphore to signal before presenting
+        present_info.waitSemaphoreCount = 1;
+        present_info.pWaitSemaphores = signal_semaphores;
+
+        // Set the swapchain to present to
+        vk::SwapchainKHR swapchains[] = { swapchain };
+        present_info.swapchainCount = 1;
+        present_info.pSwapchains = swapchains;
+        present_info.pImageIndices = &image_index;
+
+        // Present!
+        present_queue.presentKHR(present_info);
     }
 };
 
