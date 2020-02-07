@@ -1,5 +1,6 @@
 #include <vulkan/vulkan.hpp>
 #include <GLFW/glfw3.h>
+#include <glm/glm.hpp>
 
 #undef max
 #undef min
@@ -10,6 +11,46 @@
 #include <optional>
 #include <vector>
 
+struct Vertex {
+    glm::vec3 pos;
+    glm::vec3 color;
+
+    static vk::VertexInputBindingDescription input_binding_description() {
+        vk::VertexInputBindingDescription description;
+        description.binding = 0;
+        description.stride = sizeof(Vertex);
+        // Like glVertexAttribDivisor
+        description.inputRate = vk::VertexInputRate::eVertex;
+
+        return description;
+    }
+
+    static std::array<vk::VertexInputAttributeDescription, 2> attribute_descriptions() {
+        std::array<vk::VertexInputAttributeDescription, 2> attributes;
+
+        // Position
+
+        // This binding is the same as the binding above
+        attributes[0].binding = 0;
+        attributes[0].location = 0;
+        attributes[0].format = vk::Format::eR32G32B32Sfloat;
+        attributes[0].offset = offsetof(Vertex, pos);
+        // Color
+        attributes[1].binding = 0;
+        attributes[1].location = 1;
+        attributes[1].format = vk::Format::eR32G32B32Sfloat;
+        attributes[1].offset = offsetof(Vertex, color);
+
+        return attributes;
+    }
+};
+
+constexpr std::array<Vertex, 3> triangle_verts = {
+    Vertex{{0.0f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}},
+    Vertex{{0.5f, 0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}},
+    Vertex{{-0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}}
+};
+
 constexpr size_t max_frames_in_flight = 2;
 
 static std::string read_file(std::string_view fname) {
@@ -18,8 +59,6 @@ static std::string read_file(std::string_view fname) {
 }
 
 static GLFWwindow* init_glfw(size_t w, size_t h, const char* title) {
-    glfwInit();
-
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
     GLFWwindow* window = glfwCreateWindow(w, h, title, nullptr, nullptr);
@@ -137,7 +176,7 @@ static vk::PresentModeKHR choose_swap_present_mode(std::vector<vk::PresentModeKH
 }
 
 static vk::Extent2D choose_swap_extent(vk::SurfaceCapabilitiesKHR const& capabilities, size_t window_w, size_t window_h) {
-    if (capabilities.currentExtent.width != std::numeric_limits<std::uint32_t>::max()) {
+    if (capabilities.currentExtent.width != std::numeric_limits<uint32_t>::max()) {
         return capabilities.currentExtent;
     }
 
@@ -224,11 +263,14 @@ public:
         create_graphics_pipeline();
         create_framebuffers();
         create_command_pool();
+        create_vertex_buffer();
         create_command_buffers();
         create_sync_objects();
     }
 
     ~VulkanApp() {
+        device.freeMemory(vertex_buffer_memory);
+        device.destroyBuffer(vertex_buffer);
         for (auto& sync_set : sync_objects) {
             device.destroySemaphore(sync_set.image_available);
             device.destroySemaphore(sync_set.render_finished);
@@ -308,6 +350,9 @@ private:
 
     std::vector<SyncObjects> sync_objects;
     std::vector<vk::Fence> images_in_flight;
+
+    vk::Buffer vertex_buffer;
+    vk::DeviceMemory vertex_buffer_memory;
 
     void get_available_instance_extensions() {
         extensions = vk::enumerateInstanceExtensionProperties();
@@ -414,7 +459,7 @@ private:
 
         // Create a single graphics queue
         std::vector<vk::DeviceQueueCreateInfo> queue_infos;
-        std::vector<std::uint32_t> queue_families = { indices.graphics_family.value(), indices.present_family.value() };
+        std::vector<uint32_t> queue_families = { indices.graphics_family.value(), indices.present_family.value() };
         float priority = 1.0f;
         for (auto family : queue_families) {
             vk::DeviceQueueCreateInfo info;
@@ -455,7 +500,7 @@ private:
         vk::Extent2D extent = choose_swap_extent(swap_chain_support.capabilities, window_w, window_h);
 
         // + 1 because we want to avoid the driver stalling if we do not have enough images
-        std::uint32_t image_count = swap_chain_support.capabilities.minImageCount + 1;
+        uint32_t image_count = swap_chain_support.capabilities.minImageCount + 1;
         // Make sure not to exceed the maximum amount of images. 0 means no limit.
         if (swap_chain_support.capabilities.maxImageCount > 0 &&
             swap_chain_support.capabilities.maxImageCount < image_count) {
@@ -475,7 +520,7 @@ private:
         info.imageUsage = vk::ImageUsageFlagBits::eColorAttachment;
 
         QueueFamilyIndices indices = find_queue_families(physical_device, surface);
-        std::uint32_t indices_array[] = { indices.graphics_family.value(), indices.present_family.value() };
+        uint32_t indices_array[] = { indices.graphics_family.value(), indices.present_family.value() };
         // If the graphics and present queue are different, we have to tell Vulkan that we are using the swapchain image
         // concurrently.
         if(indices.graphics_family.value() != indices.present_family.value()) {
@@ -526,7 +571,7 @@ private:
     vk::ShaderModule create_shader_module(std::string const& code) {
         vk::ShaderModuleCreateInfo info;
         info.codeSize = code.size();
-        info.pCode = reinterpret_cast<std::uint32_t const*>(code.data());
+        info.pCode = reinterpret_cast<uint32_t const*>(code.data());
         return device.createShaderModule(info);
     }
 
@@ -596,11 +641,14 @@ private:
 
         // Similar to OpenGL vao objects
         vk::PipelineVertexInputStateCreateInfo vertex_input_info;
-        // Since we're hardcoding vertex data in the shader, we will set this up so that there is no info
-        vertex_input_info.vertexBindingDescriptionCount = 0;
-        vertex_input_info.pVertexBindingDescriptions = nullptr;
-        vertex_input_info.vertexAttributeDescriptionCount = 0;
-        vertex_input_info.pVertexAttributeDescriptions = nullptr;
+        
+        auto const binding_info = Vertex::input_binding_description();
+        auto const attribute_info = Vertex::attribute_descriptions();
+
+        vertex_input_info.vertexBindingDescriptionCount = 1;
+        vertex_input_info.pVertexBindingDescriptions = &binding_info;
+        vertex_input_info.vertexAttributeDescriptionCount = attribute_info.size();
+        vertex_input_info.pVertexAttributeDescriptions = attribute_info.data();
 
         vk::PipelineInputAssemblyStateCreateInfo input_assembly_info;
         input_assembly_info.topology = vk::PrimitiveTopology::eTriangleList;
@@ -720,6 +768,49 @@ private:
         command_pool = device.createCommandPool(info);
     }
 
+    uint32_t find_memory_type(uint32_t type_filter, vk::MemoryPropertyFlags properties) {
+        // Get available memory types
+        vk::PhysicalDeviceMemoryProperties const device_properties = physical_device.getMemoryProperties();
+        // Find a matching one
+        for (uint32_t i = 0; i < device_properties.memoryTypeCount; ++i) {
+            // If the filter matches the memory type, return the index of the memory type
+            if (type_filter & (1 << i) && 
+                (device_properties.memoryTypes[i].propertyFlags & properties)) { // Also check if memory properties match
+                return i;
+            }
+        }
+
+        assert(false && "Failed to find suitable memory type\n");
+        return -1;
+    }
+
+    void create_vertex_buffer() {
+        vk::BufferCreateInfo info;
+        info.size = triangle_verts.size() * sizeof(Vertex);
+        info.usage = vk::BufferUsageFlagBits::eVertexBuffer;
+        // This buffer is only used by a single queue family
+        info.sharingMode = vk::SharingMode::eExclusive;
+
+        vertex_buffer = device.createBuffer(info);
+
+        // Allocate memory for the buffer
+        vk::MemoryRequirements const mem_requirements = device.getBufferMemoryRequirements(vertex_buffer);
+
+        vk::MemoryAllocateInfo alloc_info;
+        alloc_info.allocationSize = mem_requirements.size;
+        alloc_info.memoryTypeIndex = find_memory_type(mem_requirements.memoryTypeBits, 
+                                        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        vertex_buffer_memory = device.allocateMemory(alloc_info);
+        // Bind the vertex buffer to the memory. The last parameter is the byte offset into the memory
+        device.bindBufferMemory(vertex_buffer, vertex_buffer_memory, 0);
+
+        // Fill the buffer with our vertex data. Because we're using host coherent memory, we don't have to 
+        // explicitly flush the buffer after writing.
+        void* data = device.mapMemory(vertex_buffer_memory, 0, info.size);
+        std::memcpy(data, &triangle_verts[0], info.size);
+        device.unmapMemory(vertex_buffer_memory);
+    }
+
     void create_command_buffers() {
         // Create the command buffers
         vk::CommandBufferAllocateInfo info;
@@ -750,6 +841,10 @@ private:
             cmd_buffer.beginRenderPass(render_pass_info, vk::SubpassContents::eInline);
             // Bind the graphics pipeline
             cmd_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, graphics_pipeline);
+            // Bind the vertex buffer
+            vk::Buffer vertex_buffers[] = { vertex_buffer };
+            vk::DeviceSize offset = 0;
+            cmd_buffer.bindVertexBuffers(0, vertex_buffer, offset);
             // Do the drawcall
             cmd_buffer.draw(3, 1, 0, 0);
             // End command buffer
@@ -782,7 +877,7 @@ private:
         // 3. Send it back to the swapchain for presenting
 
         // Step 1: Aqcuire image from swapchain
-        std::uint32_t image_index = device.acquireNextImageKHR(swapchain, std::numeric_limits<std::uint64_t>::max(), 
+        uint32_t image_index = device.acquireNextImageKHR(swapchain, std::numeric_limits<std::uint64_t>::max(), 
                                                                sync_objects[current_frame].image_available, nullptr).value;
         // Check if a previous frame is using this image
         if (images_in_flight[image_index]) {
@@ -835,8 +930,10 @@ private:
     }
 };
 
+#include <thread>
 
 int main() {
+    glfwInit();
     VulkanApp app(1280, 720, "Vulkan");
     app.run();
 
