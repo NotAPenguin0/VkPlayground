@@ -11,6 +11,8 @@
 #include <optional>
 #include <vector>
 
+#include "VkBuffer.hpp"
+
 struct Vertex {
     glm::vec3 pos;
     glm::vec3 color;
@@ -45,10 +47,15 @@ struct Vertex {
     }
 };
 
-constexpr std::array<Vertex, 3> triangle_verts = {
-    Vertex{{0.0f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}},
-    Vertex{{0.5f, 0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}},
-    Vertex{{-0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}}
+constexpr std::array<Vertex, 4> vertices = {
+    Vertex{{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}},
+    Vertex{{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}},
+    Vertex{{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}},
+    Vertex{{-0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 1.0f}}
+};
+
+constexpr std::array<uint32_t, 6> indices = {
+    0, 1, 2, 2, 3, 0
 };
 
 constexpr size_t max_frames_in_flight = 2;
@@ -264,13 +271,14 @@ public:
         create_framebuffers();
         create_command_pool();
         create_vertex_buffer();
+        create_index_buffer();
         create_command_buffers();
         create_sync_objects();
     }
 
     ~VulkanApp() {
-        device.freeMemory(vertex_buffer_memory);
-        device.destroyBuffer(vertex_buffer);
+        index_buffer.destroy();
+        vertex_buffer.destroy();
         for (auto& sync_set : sync_objects) {
             device.destroySemaphore(sync_set.image_available);
             device.destroySemaphore(sync_set.render_finished);
@@ -351,8 +359,8 @@ private:
     std::vector<SyncObjects> sync_objects;
     std::vector<vk::Fence> images_in_flight;
 
-    vk::Buffer vertex_buffer;
-    vk::DeviceMemory vertex_buffer_memory;
+    Buffer vertex_buffer;
+    Buffer index_buffer;
 
     void get_available_instance_extensions() {
         extensions = vk::enumerateInstanceExtensionProperties();
@@ -768,47 +776,44 @@ private:
         command_pool = device.createCommandPool(info);
     }
 
-    uint32_t find_memory_type(uint32_t type_filter, vk::MemoryPropertyFlags properties) {
-        // Get available memory types
-        vk::PhysicalDeviceMemoryProperties const device_properties = physical_device.getMemoryProperties();
-        // Find a matching one
-        for (uint32_t i = 0; i < device_properties.memoryTypeCount; ++i) {
-            // If the filter matches the memory type, return the index of the memory type
-            if (type_filter & (1 << i) && 
-                (device_properties.memoryTypes[i].propertyFlags & properties)) { // Also check if memory properties match
-                return i;
-            }
-        }
+    void create_vertex_buffer() {
+        vk::DeviceSize buffer_size = vertices.size() * sizeof(Vertex);
+        // Create staging buffer for transfer
+        Buffer staging_buffer(physical_device, device, buffer_size, vk::BufferUsageFlagBits::eTransferSrc, 
+                              vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostVisible);
+        // Copy data to staging buffer
+        void* data_ptr;
+        data_ptr = device.mapMemory(staging_buffer.memory_handle(), 0, buffer_size);
+        std::memcpy(data_ptr, &vertices[0], buffer_size);
+        device.unmapMemory(staging_buffer.memory_handle());
 
-        assert(false && "Failed to find suitable memory type\n");
-        return -1;
+        // Create vertex buffer in device local memory and copy contents
+        vertex_buffer = Buffer(physical_device, device, buffer_size, 
+                               vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eVertexBuffer, 
+                               vk::MemoryPropertyFlagBits::eDeviceLocal);
+        // Do the copy
+        copy_buffers(staging_buffer, vertex_buffer, buffer_size, command_pool, graphics_queue);
+        // Temporary staging buffer is destroyed by the Buffer destructor
     }
 
-    void create_vertex_buffer() {
-        vk::BufferCreateInfo info;
-        info.size = triangle_verts.size() * sizeof(Vertex);
-        info.usage = vk::BufferUsageFlagBits::eVertexBuffer;
-        // This buffer is only used by a single queue family
-        info.sharingMode = vk::SharingMode::eExclusive;
+    void create_index_buffer() {
+         vk::DeviceSize buffer_size = indices.size() * sizeof(uint32_t);
+        // Create staging buffer for transfer
+        Buffer staging_buffer(physical_device, device, buffer_size, vk::BufferUsageFlagBits::eTransferSrc, 
+                              vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostVisible);
+        // Copy data to staging buffer
+        void* data_ptr;
+        data_ptr = device.mapMemory(staging_buffer.memory_handle(), 0, buffer_size);
+        std::memcpy(data_ptr, &indices[0], buffer_size);
+        device.unmapMemory(staging_buffer.memory_handle());
 
-        vertex_buffer = device.createBuffer(info);
-
-        // Allocate memory for the buffer
-        vk::MemoryRequirements const mem_requirements = device.getBufferMemoryRequirements(vertex_buffer);
-
-        vk::MemoryAllocateInfo alloc_info;
-        alloc_info.allocationSize = mem_requirements.size;
-        alloc_info.memoryTypeIndex = find_memory_type(mem_requirements.memoryTypeBits, 
-                                        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
-        vertex_buffer_memory = device.allocateMemory(alloc_info);
-        // Bind the vertex buffer to the memory. The last parameter is the byte offset into the memory
-        device.bindBufferMemory(vertex_buffer, vertex_buffer_memory, 0);
-
-        // Fill the buffer with our vertex data. Because we're using host coherent memory, we don't have to 
-        // explicitly flush the buffer after writing.
-        void* data = device.mapMemory(vertex_buffer_memory, 0, info.size);
-        std::memcpy(data, &triangle_verts[0], info.size);
-        device.unmapMemory(vertex_buffer_memory);
+        // Create index buffer in device local memory and copy contents
+        index_buffer = Buffer(physical_device, device, buffer_size, 
+                              vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eIndexBuffer, 
+                              vk::MemoryPropertyFlagBits::eDeviceLocal);
+        // Do the copy
+        copy_buffers(staging_buffer, index_buffer, buffer_size, command_pool, graphics_queue);
+        // Temporary staging buffer is destroyed by the Buffer destructor
     }
 
     void create_command_buffers() {
@@ -841,12 +846,12 @@ private:
             cmd_buffer.beginRenderPass(render_pass_info, vk::SubpassContents::eInline);
             // Bind the graphics pipeline
             cmd_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, graphics_pipeline);
-            // Bind the vertex buffer
-            vk::Buffer vertex_buffers[] = { vertex_buffer };
+            // Bind the vertex and index buffer
             vk::DeviceSize offset = 0;
-            cmd_buffer.bindVertexBuffers(0, vertex_buffer, offset);
+            cmd_buffer.bindVertexBuffers(0, vertex_buffer.handle(), offset);
+            cmd_buffer.bindIndexBuffer(index_buffer.handle(), 0, vk::IndexType::eUint32);
             // Do the drawcall
-            cmd_buffer.draw(3, 1, 0, 0);
+            cmd_buffer.drawIndexed(indices.size(), 1, 0, 0, 0);
             // End command buffer
             cmd_buffer.endRenderPass();
             cmd_buffer.end();

@@ -9,7 +9,7 @@ set(Vulkan_LIBRARY CACHE STRING "Vulkan library path")
 set(Vulkan_INCLUDE_DIR CACHE STRING "Vulkan include directory")
 
 set(VK_PLAYGROUND_SOURCES "")
-set(VK_PLAYGROUND_INCLUDE_DIRS "")
+set(VK_PLAYGROUND_INCLUDE_DIRS "include")
 set(VK_PLAYGROUND_LINK_LIBRARIES "")
 
 add_subdirectory("src")
