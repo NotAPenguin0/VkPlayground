@@ -1,6 +1,9 @@
 #include <vulkan/vulkan.hpp>
 #include <GLFW/glfw3.h>
+
+#define GLM_FORCE_DEFAULT_ALIGNED_GENTYPES
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 
 #undef max
 #undef min
@@ -45,6 +48,12 @@ struct Vertex {
 
         return attributes;
     }
+};
+
+struct Matrices {
+    glm::mat4 model;
+    glm::mat4 view;
+    glm::mat4 projection;
 };
 
 constexpr std::array<Vertex, 4> vertices = {
@@ -267,16 +276,25 @@ public:
         create_swapchain();
         create_image_views();
         create_render_pass();
+        create_descriptor_set_layout();
         create_graphics_pipeline();
         create_framebuffers();
         create_command_pool();
         create_vertex_buffer();
         create_index_buffer();
+        create_uniform_buffers();
+        create_descriptor_pool();
+        create_descriptor_sets();
         create_command_buffers();
         create_sync_objects();
     }
 
     ~VulkanApp() {
+        device.destroyDescriptorPool(descriptor_pool);
+        for (auto& uniform_buf : uniform_buffers) {
+            uniform_buf.destroy();
+        }
+        device.destroyDescriptorSetLayout(descriptor_set_layout);
         index_buffer.destroy();
         vertex_buffer.destroy();
         for (auto& sync_set : sync_objects) {
@@ -338,6 +356,7 @@ private:
     vk::Format swapchain_format;
     vk::Extent2D swapchain_extent;
 
+    vk::DescriptorSetLayout descriptor_set_layout;
     vk::PipelineLayout pipeline_layout;
     vk::RenderPass render_pass;
     vk::Pipeline graphics_pipeline;
@@ -361,6 +380,11 @@ private:
 
     Buffer vertex_buffer;
     Buffer index_buffer;
+
+    std::vector<Buffer> uniform_buffers;
+
+    vk::DescriptorPool descriptor_pool;
+    std::vector<vk::DescriptorSet> descriptor_sets;
 
     void get_available_instance_extensions() {
         extensions = vk::enumerateInstanceExtensionProperties();
@@ -626,6 +650,22 @@ private:
         render_pass = device.createRenderPass(render_pass_info);
     }
 
+    void create_descriptor_set_layout() {
+        vk::DescriptorSetLayoutBinding binding;
+        binding.binding = 0;
+        // There is only one UBO for this binding (so it's not a UBO array basically)
+        binding.descriptorCount = 1;
+        binding.descriptorType = vk::DescriptorType::eUniformBuffer;
+        // UBO is only visible in the vertex shader
+        binding.stageFlags = vk::ShaderStageFlagBits::eVertex;
+
+        vk::DescriptorSetLayoutCreateInfo info;
+        info.bindingCount = 1;
+        info.pBindings = &binding;
+
+        descriptor_set_layout = device.createDescriptorSetLayout(info);
+    }
+
     void create_graphics_pipeline() {
         std::string vert_shader_code = read_file("shaders/shader.vert.spv");
         std::string frag_shader_code = read_file("shaders/shader.frag.spv");
@@ -687,7 +727,7 @@ private:
         rasterization_info.polygonMode = vk::PolygonMode::eFill;
         rasterization_info.lineWidth = 1.0f;
         rasterization_info.cullMode = vk::CullModeFlagBits::eBack;
-        rasterization_info.frontFace = vk::FrontFace::eClockwise;
+        rasterization_info.frontFace = vk::FrontFace::eCounterClockwise;
         // This setting can be useful for shadow mapping. Requires additional values to be set.
         rasterization_info.depthBiasEnable = false;
 
@@ -722,6 +762,8 @@ private:
 
         // The pipeline layout specifies uniforms
         vk::PipelineLayoutCreateInfo pipeline_layout_info;
+        pipeline_layout_info.setLayoutCount = 1;
+        pipeline_layout_info.pSetLayouts = &descriptor_set_layout;
         pipeline_layout = device.createPipelineLayout(pipeline_layout_info);
 
         // Create the actual graphics pipeline
@@ -816,6 +858,58 @@ private:
         // Temporary staging buffer is destroyed by the Buffer destructor
     }
 
+    void create_uniform_buffers() {
+        uniform_buffers.resize(swapchain_image_views.size());
+
+        vk::DeviceSize size = sizeof(Matrices);
+        for (auto& uniform_buffer : uniform_buffers) {
+            uniform_buffer = Buffer(physical_device, device, size, vk::BufferUsageFlagBits::eUniformBuffer, 
+                                    vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);                        
+        }
+    }
+
+    void create_descriptor_pool() {
+        vk::DescriptorPoolSize size;
+        size.type = vk::DescriptorType::eUniformBuffer;
+        size.descriptorCount = swapchain_images.size();
+
+        vk::DescriptorPoolCreateInfo info;
+        info.poolSizeCount = 1;
+        info.pPoolSizes = &size;
+        info.maxSets = swapchain_images.size();
+
+        descriptor_pool = device.createDescriptorPool(info);
+    }
+
+    void create_descriptor_sets() {
+        // Allocate descriptor sets
+        std::vector<vk::DescriptorSetLayout> layouts(swapchain_images.size(), descriptor_set_layout);
+        vk::DescriptorSetAllocateInfo alloc_info;
+        alloc_info.descriptorPool = descriptor_pool;
+        alloc_info.descriptorSetCount = swapchain_images.size();
+        alloc_info.pSetLayouts = layouts.data();
+        descriptor_sets = device.allocateDescriptorSets(alloc_info);
+
+        // Configure descriptor sets
+        for (size_t i = 0; i < descriptor_sets.size(); ++i) {
+            vk::DescriptorBufferInfo buffer_info;
+            buffer_info.buffer = uniform_buffers[i].handle();
+            buffer_info.offset = 0;
+            buffer_info.range = sizeof(Matrices);
+
+            // We update a descriptor set using a vk::WriteDescriptorSet struct
+            vk::WriteDescriptorSet write_info;
+            write_info.dstSet = descriptor_sets[i];
+            write_info.pBufferInfo = &buffer_info;
+            write_info.dstBinding = 0;
+            // Not an array
+            write_info.dstArrayElement = 0;
+            write_info.descriptorType = vk::DescriptorType::eUniformBuffer;
+            write_info.descriptorCount = 1;
+            device.updateDescriptorSets(write_info, nullptr);
+        }
+    }
+
     void create_command_buffers() {
         // Create the command buffers
         vk::CommandBufferAllocateInfo info;
@@ -850,6 +944,8 @@ private:
             vk::DeviceSize offset = 0;
             cmd_buffer.bindVertexBuffers(0, vertex_buffer.handle(), offset);
             cmd_buffer.bindIndexBuffer(index_buffer.handle(), 0, vk::IndexType::eUint32);
+            // Bind descriptor set
+            cmd_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline_layout, 0, descriptor_sets[i], nullptr);
             // Do the drawcall
             cmd_buffer.drawIndexed(indices.size(), 1, 0, 0, 0);
             // End command buffer
@@ -872,6 +968,25 @@ private:
         images_in_flight.resize(swapchain_images.size(), nullptr);
     }
 
+    void update_uniform_buffer(size_t image_index) {
+        static const float start_time = (float)glfwGetTime();
+
+        float const current_time = (float)glfwGetTime();
+        float const time = current_time - start_time;
+
+        Matrices matrices;
+        matrices.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0, 0, 1));
+        matrices.view = glm::lookAt(glm::vec3(2, 2, 2), glm::vec3(0, 0, 0), glm::vec3(0, 0, 1));
+        matrices.projection = glm::perspective(glm::radians(45.0f), (float)window_w / (float)window_h, 0.1f, 100.0f);
+        // GLM was made for OpenGL, so we have to flip the Y axis
+        matrices.projection[1][1] *= -1;
+
+        // Note that this is not a good way to copy data to uniform buffers
+        void* data_ptr = device.mapMemory(uniform_buffers[image_index].memory_handle(), 0, sizeof(Matrices));
+        std::memcpy(data_ptr, &matrices, sizeof(Matrices));
+        device.unmapMemory(uniform_buffers[image_index].memory_handle());
+    }
+
     void render_frame() {
         // Wait for an available spot in the in-flight frames array
         device.waitForFences(sync_objects[current_frame].frame_fence, true, std::numeric_limits<std::uint64_t>::max());
@@ -891,6 +1006,8 @@ private:
 
         // Mark this image in use by the current frame
         images_in_flight[image_index] = sync_objects[current_frame].frame_fence;
+
+        update_uniform_buffer(image_index);
 
         // Step 2: Submit command buffer
         vk::SubmitInfo submit_info;
@@ -935,7 +1052,6 @@ private:
     }
 };
 
-#include <thread>
 
 int main() {
     glfwInit();
