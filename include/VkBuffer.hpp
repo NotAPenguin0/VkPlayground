@@ -3,6 +3,8 @@
 
 #include <vulkan/vulkan.hpp>
 
+uint32_t find_memory_type(vk::PhysicalDevice physical_device, uint32_t type_filter, vk::MemoryPropertyFlags properties);
+
 class Buffer {
 public:
     Buffer() = default;

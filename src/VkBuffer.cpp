@@ -1,6 +1,6 @@
 #include "VkBuffer.hpp"
 
-static uint32_t find_memory_type(vk::PhysicalDevice physical_device, uint32_t type_filter, vk::MemoryPropertyFlags properties) {
+uint32_t find_memory_type(vk::PhysicalDevice physical_device, uint32_t type_filter, vk::MemoryPropertyFlags properties) {
     // Get available memory types
     vk::PhysicalDeviceMemoryProperties const device_properties = physical_device.getMemoryProperties();
     // Find a matching one

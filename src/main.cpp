@@ -1,6 +1,8 @@
 #include <vulkan/vulkan.hpp>
 #include <GLFW/glfw3.h>
 
+#include <stb/stb_image.h>
+
 #define GLM_FORCE_DEFAULT_ALIGNED_GENTYPES
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -19,6 +21,7 @@
 struct Vertex {
     glm::vec3 pos;
     glm::vec3 color;
+    glm::vec2 tex_coords;
 
     static vk::VertexInputBindingDescription input_binding_description() {
         vk::VertexInputBindingDescription description;
@@ -30,8 +33,8 @@ struct Vertex {
         return description;
     }
 
-    static std::array<vk::VertexInputAttributeDescription, 2> attribute_descriptions() {
-        std::array<vk::VertexInputAttributeDescription, 2> attributes;
+    static std::array<vk::VertexInputAttributeDescription, 3> attribute_descriptions() {
+        std::array<vk::VertexInputAttributeDescription, 3> attributes;
 
         // Position
 
@@ -46,6 +49,11 @@ struct Vertex {
         attributes[1].format = vk::Format::eR32G32B32Sfloat;
         attributes[1].offset = offsetof(Vertex, color);
 
+        attributes[2].binding = 0;
+        attributes[2].location = 2;
+        attributes[2].format = vk::Format::eR32G32Sfloat;
+        attributes[2].offset = offsetof(Vertex, tex_coords);
+
         return attributes;
     }
 };
@@ -57,10 +65,10 @@ struct Matrices {
 };
 
 constexpr std::array<Vertex, 4> vertices = {
-    Vertex{{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}},
-    Vertex{{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}},
-    Vertex{{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}},
-    Vertex{{-0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 1.0f}}
+    Vertex{{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f}},
+    Vertex{{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
+    Vertex{{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}},
+    Vertex{{-0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}}
 };
 
 constexpr std::array<uint32_t, 6> indices = {
@@ -259,6 +267,135 @@ static int physical_device_score(vk::PhysicalDevice device, vk::SurfaceKHR surfa
     return score;
 }
 
+static void create_image(vk::PhysicalDevice physical_device, vk::Device device, size_t width, size_t height, vk::Format format,
+                  vk::ImageTiling tiling, vk::ImageUsageFlags usage, vk::MemoryPropertyFlags properties, 
+                  vk::Image& image, vk::DeviceMemory& image_memory) {
+
+    vk::ImageCreateInfo image_info;
+    image_info.imageType = vk::ImageType::e2D;
+    image_info.extent.width = width;
+    image_info.extent.height = height;
+    image_info.extent.depth = 1;
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+
+    image_info.format = format;
+    image_info.tiling = tiling;
+    image_info.initialLayout = vk::ImageLayout::eUndefined;
+    image_info.usage = usage;
+    image_info.samples = vk::SampleCountFlagBits::e1;
+
+    image = device.createImage(image_info);
+
+    // Allocate memory for the image
+    vk::MemoryRequirements const mem_requirements = device.getImageMemoryRequirements(image);
+    vk::MemoryAllocateInfo alloc_info;
+    alloc_info.allocationSize = mem_requirements.size;
+    alloc_info.memoryTypeIndex = find_memory_type(physical_device, mem_requirements.memoryTypeBits, properties);
+    image_memory = device.allocateMemory(alloc_info);
+    device.bindImageMemory(image, image_memory, 0);
+}
+
+static vk::CommandBuffer begin_single_time_command_buffer(vk::Device device, vk::CommandPool pool) {
+    vk::CommandBufferAllocateInfo info;
+    info.level = vk::CommandBufferLevel::ePrimary;
+    info.commandBufferCount = 1;
+    info.commandPool = pool;
+
+    vk::CommandBuffer buffer = device.allocateCommandBuffers(info)[0];
+
+    vk::CommandBufferBeginInfo begin_info;
+    begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+    buffer.begin(begin_info);
+
+    return buffer;
+}
+
+static void end_single_time_command_buffer(vk::Device device, vk::CommandBuffer buffer, vk::CommandPool pool, vk::Queue queue) {
+    buffer.end();
+
+    vk::SubmitInfo info;
+    info.commandBufferCount = 1;
+    info.pCommandBuffers = &buffer;
+    
+    queue.submit(info, nullptr);
+    queue.waitIdle();
+
+    device.freeCommandBuffers(pool, buffer);
+}
+
+static void transition_image_layout(vk::Device device, vk::CommandBuffer cmd_buf, vk::Image image, 
+                                    vk::Format format, vk::ImageLayout old_layout, vk::ImageLayout new_layout) {
+    
+    vk::ImageMemoryBarrier barrier;
+    barrier.oldLayout = old_layout;
+    barrier.newLayout = new_layout;
+    // We don't want to transfer queue family ownership
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    
+    barrier.image = image;
+    barrier.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.layerCount = 1;
+    barrier.subresourceRange.levelCount = 1;
+
+    vk::PipelineStageFlags src_stage;
+    vk::PipelineStageFlags dst_stage;
+
+    // Figure out source and desitionation stage based on image layouts
+    if (old_layout == vk::ImageLayout::eUndefined && new_layout == vk::ImageLayout::eTransferDstOptimal) {
+        barrier.srcAccessMask = vk::AccessFlags {};
+        barrier.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+
+        src_stage = vk::PipelineStageFlagBits::eTopOfPipe;
+        dst_stage = vk::PipelineStageFlagBits::eTransfer;
+    } else if (old_layout == vk::ImageLayout::eTransferDstOptimal && new_layout == vk::ImageLayout::eShaderReadOnlyOptimal) {
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead;
+
+        src_stage = vk::PipelineStageFlagBits::eTransfer;
+        dst_stage = vk::PipelineStageFlagBits::eFragmentShader;
+    } else {
+        throw std::invalid_argument("Unsupported image layout transition");
+    }
+
+    cmd_buf.pipelineBarrier(src_stage, dst_stage, vk::DependencyFlagBits::eByRegion, nullptr, nullptr, barrier);
+}
+
+static void copy_buffer_to_image(vk::Device device, vk::CommandBuffer cmd_buf, Buffer& buf, vk::Image image,
+                                 vk::ImageLayout image_layout, size_t width, size_t height) {
+    vk::BufferImageCopy copy_region;
+    copy_region.bufferOffset = 0;
+    // Values of 0 means tightly packed here
+    copy_region.bufferRowLength = 0;
+    copy_region.bufferImageHeight = 0;
+
+    copy_region.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+    copy_region.imageSubresource.baseArrayLayer = 0;
+    copy_region.imageSubresource.layerCount = 1;
+    copy_region.imageSubresource.mipLevel = 0;
+    
+    copy_region.imageOffset = vk::Offset3D{0, 0, 0};
+    copy_region.imageExtent = vk::Extent3D{static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1};
+
+    cmd_buf.copyBufferToImage(buf.handle(), image, image_layout, copy_region);
+}
+
+static vk::ImageView create_image_view(vk::Device device, vk::Image image, vk::Format format) {
+    vk::ImageViewCreateInfo info;
+    info.format = format;
+    info.image = image;
+    info.viewType = vk::ImageViewType::e2D;
+    info.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+    info.subresourceRange.baseArrayLayer = 0;
+    info.subresourceRange.layerCount = 1;
+    info.subresourceRange.baseMipLevel = 0;
+    info.subresourceRange.levelCount = 1;
+
+    return device.createImageView(info);
+}
 
 class VulkanApp {
 public:
@@ -279,7 +416,10 @@ public:
         create_descriptor_set_layout();
         create_graphics_pipeline();
         create_framebuffers();
-        create_command_pool();
+        create_command_pools();
+        create_texture_image();
+        create_texture_image_view();
+        create_texture_sampler();
         create_vertex_buffer();
         create_index_buffer();
         create_uniform_buffers();
@@ -290,6 +430,10 @@ public:
     }
 
     ~VulkanApp() {
+        device.destroySampler(texture_sampler);
+        device.destroyImageView(texture_image_view);
+        device.destroyImage(texture_image);
+        device.freeMemory(texture_image_memory);
         device.destroyDescriptorPool(descriptor_pool);
         for (auto& uniform_buf : uniform_buffers) {
             uniform_buf.destroy();
@@ -304,6 +448,7 @@ public:
         }
 
         device.destroyCommandPool(command_pool);
+        device.destroyCommandPool(transient_pool);
         for (auto const& framebuf : swapchain_framebuffers) {
             device.destroyFramebuffer(framebuf);
         }
@@ -325,9 +470,16 @@ public:
 
     void run() {
         while(!glfwWindowShouldClose(window)) {
+            static float last_frame_time = glfwGetTime();
+            float frame_time = glfwGetTime();
+            float delta_time = frame_time - last_frame_time;
+            if (std::fmod(frame_time, 3.0f) < 0.01f) {
+                std::cout << 1.0f / delta_time << "\n";
+            }
             glfwPollEvents();
             render_frame();
             current_frame = (current_frame + 1) % max_frames_in_flight;
+            last_frame_time = frame_time;
         }
         
         // Wait until everything is done before starting to deallocate stuff
@@ -364,6 +516,7 @@ private:
     std::vector<vk::Framebuffer> swapchain_framebuffers;
 
     vk::CommandPool command_pool;
+    vk::CommandPool transient_pool;
     std::vector<vk::CommandBuffer> command_buffers;
 
     size_t current_frame = 0;
@@ -380,6 +533,11 @@ private:
 
     Buffer vertex_buffer;
     Buffer index_buffer;
+
+    vk::Image texture_image;
+    vk::DeviceMemory texture_image_memory;
+    vk::ImageView texture_image_view;
+    vk::Sampler texture_sampler;
 
     std::vector<Buffer> uniform_buffers;
 
@@ -505,6 +663,7 @@ private:
 
         // Enumerate features we want enabled. We leave this at the default for now
         vk::PhysicalDeviceFeatures features;
+        features.samplerAnisotropy = true;
 
         // Create the actual device
         vk::DeviceCreateInfo device_info;
@@ -651,17 +810,26 @@ private:
     }
 
     void create_descriptor_set_layout() {
-        vk::DescriptorSetLayoutBinding binding;
-        binding.binding = 0;
+        vk::DescriptorSetLayoutBinding ubo_binding;
+        ubo_binding.binding = 0;
         // There is only one UBO for this binding (so it's not a UBO array basically)
-        binding.descriptorCount = 1;
-        binding.descriptorType = vk::DescriptorType::eUniformBuffer;
+        ubo_binding.descriptorCount = 1;
+        ubo_binding.descriptorType = vk::DescriptorType::eUniformBuffer;
         // UBO is only visible in the vertex shader
-        binding.stageFlags = vk::ShaderStageFlagBits::eVertex;
+        ubo_binding.stageFlags = vk::ShaderStageFlagBits::eVertex;
+
+        vk::DescriptorSetLayoutBinding sampler_binding;
+        sampler_binding.binding = 1;
+        sampler_binding.descriptorCount = 1;
+        sampler_binding.descriptorType = vk::DescriptorType::eCombinedImageSampler;
+        sampler_binding.pImmutableSamplers = nullptr;
+        sampler_binding.stageFlags = vk::ShaderStageFlagBits::eFragment;
+
+        vk::DescriptorSetLayoutBinding bindings[] = { ubo_binding, sampler_binding };
 
         vk::DescriptorSetLayoutCreateInfo info;
-        info.bindingCount = 1;
-        info.pBindings = &binding;
+        info.bindingCount = 2;
+        info.pBindings = bindings;
 
         descriptor_set_layout = device.createDescriptorSetLayout(info);
     }
@@ -810,12 +978,80 @@ private:
         }
     }
 
-    void create_command_pool() {
+    void create_command_pools() {
         QueueFamilyIndices queue_families = find_queue_families(physical_device, surface);
         vk::CommandPoolCreateInfo info;
         info.queueFamilyIndex = queue_families.graphics_family.value();
 
         command_pool = device.createCommandPool(info);
+
+        info.flags = vk::CommandPoolCreateFlagBits::eTransient;
+        transient_pool = device.createCommandPool(info);
+    }
+
+    void create_texture_image() {
+        int width, height, channels;
+        unsigned char* pixels = stbi_load("textures/pengu.png", &width, &height, &channels, STBI_rgb_alpha);
+
+        if (!pixels) {
+            std::cerr << "Failed to load image\n";
+            return;
+        }
+
+        vk::DeviceSize const image_size = width * height * 4;
+
+        Buffer staging_buffer(physical_device, device, image_size, vk::BufferUsageFlagBits::eTransferSrc, 
+                              vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostVisible);
+
+        void* data_ptr = device.mapMemory(staging_buffer.memory_handle(), 0, image_size);
+        std::memcpy(data_ptr, pixels, image_size);
+        device.unmapMemory(staging_buffer.memory_handle());
+        // We no longer need the pixel data here
+        stbi_image_free(pixels);
+
+        // Create the image
+        create_image(physical_device, device, width, height, vk::Format::eR8G8B8A8Srgb, vk::ImageTiling::eOptimal, 
+                     vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled, 
+                     vk::MemoryPropertyFlagBits::eDeviceLocal, texture_image, texture_image_memory);
+        
+        vk::CommandBuffer cmd_buf = begin_single_time_command_buffer(device, transient_pool);
+
+        // Transition image layout from Undefined to TransferDstOptimal
+        transition_image_layout(device, cmd_buf, texture_image, vk::Format::eR8G8B8A8Srgb, 
+                                vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal);
+        // Copy data to image
+        copy_buffer_to_image(device, cmd_buf, staging_buffer, texture_image, 
+                             vk::ImageLayout::eTransferDstOptimal, width, height);
+        // Transition one more time so we can start sampling the image
+        transition_image_layout(device, cmd_buf, texture_image, vk::Format::eR8G8B8A8Srgb,
+                                vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal);
+        end_single_time_command_buffer(device, cmd_buf, transient_pool, graphics_queue);
+    }
+
+    void create_texture_image_view() {
+        texture_image_view = create_image_view(device, texture_image, vk::Format::eR8G8B8A8Srgb);
+    }
+
+    void create_texture_sampler() {
+        vk::SamplerCreateInfo info;
+        info.magFilter = vk::Filter::eLinear;
+        info.minFilter = vk::Filter::eLinear;
+        info.addressModeU = vk::SamplerAddressMode::eRepeat;
+        info.addressModeV = vk::SamplerAddressMode::eRepeat;
+        info.addressModeW = vk::SamplerAddressMode::eRepeat;
+        info.anisotropyEnable = true;
+        info.maxAnisotropy = 8;
+        info.borderColor = vk::BorderColor::eIntOpaqueBlack;
+        info.unnormalizedCoordinates = false;
+        info.compareEnable = false;
+        info.compareOp = vk::CompareOp::eAlways;
+
+        info.mipmapMode = vk::SamplerMipmapMode::eLinear;
+        info.mipLodBias = 0.0f;
+        info.minLod = 0.0f;
+        info.maxLod = 0.0f;
+
+        texture_sampler = device.createSampler(info);
     }
 
     void create_vertex_buffer() {
@@ -834,7 +1070,7 @@ private:
                                vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eVertexBuffer, 
                                vk::MemoryPropertyFlagBits::eDeviceLocal);
         // Do the copy
-        copy_buffers(staging_buffer, vertex_buffer, buffer_size, command_pool, graphics_queue);
+        copy_buffers(staging_buffer, vertex_buffer, buffer_size, transient_pool, graphics_queue);
         // Temporary staging buffer is destroyed by the Buffer destructor
     }
 
@@ -854,7 +1090,7 @@ private:
                               vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eIndexBuffer, 
                               vk::MemoryPropertyFlagBits::eDeviceLocal);
         // Do the copy
-        copy_buffers(staging_buffer, index_buffer, buffer_size, command_pool, graphics_queue);
+        copy_buffers(staging_buffer, index_buffer, buffer_size, transient_pool, graphics_queue);
         // Temporary staging buffer is destroyed by the Buffer destructor
     }
 
@@ -869,13 +1105,16 @@ private:
     }
 
     void create_descriptor_pool() {
-        vk::DescriptorPoolSize size;
-        size.type = vk::DescriptorType::eUniformBuffer;
-        size.descriptorCount = swapchain_images.size();
+        vk::DescriptorPoolSize sizes[2];
+        sizes[0].type = vk::DescriptorType::eUniformBuffer;
+        sizes[0].descriptorCount = swapchain_images.size();
+
+        sizes[1].type = vk::DescriptorType::eCombinedImageSampler;
+        sizes[1].descriptorCount = swapchain_images.size();
 
         vk::DescriptorPoolCreateInfo info;
-        info.poolSizeCount = 1;
-        info.pPoolSizes = &size;
+        info.poolSizeCount = 2;
+        info.pPoolSizes = sizes;
         info.maxSets = swapchain_images.size();
 
         descriptor_pool = device.createDescriptorPool(info);
@@ -897,16 +1136,30 @@ private:
             buffer_info.offset = 0;
             buffer_info.range = sizeof(Matrices);
 
+            vk::DescriptorImageInfo image_info;
+            image_info.imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+            image_info.imageView = texture_image_view;
+            image_info.sampler = texture_sampler;
+
             // We update a descriptor set using a vk::WriteDescriptorSet struct
-            vk::WriteDescriptorSet write_info;
-            write_info.dstSet = descriptor_sets[i];
-            write_info.pBufferInfo = &buffer_info;
-            write_info.dstBinding = 0;
+            std::array<vk::WriteDescriptorSet, 2> write_infos;
+            write_infos[0].dstSet = descriptor_sets[i];
+            write_infos[0].pBufferInfo = &buffer_info;
+            write_infos[0].dstBinding = 0;
             // Not an array
-            write_info.dstArrayElement = 0;
-            write_info.descriptorType = vk::DescriptorType::eUniformBuffer;
-            write_info.descriptorCount = 1;
-            device.updateDescriptorSets(write_info, nullptr);
+            write_infos[0].dstArrayElement = 0;
+            write_infos[0].descriptorType = vk::DescriptorType::eUniformBuffer;
+            write_infos[0].descriptorCount = 1;
+
+            write_infos[1].dstSet = descriptor_sets[i];
+            write_infos[1].pImageInfo = &image_info;
+            write_infos[1].dstBinding = 1;
+
+            write_infos[1].dstArrayElement = 0;
+            write_infos[1].descriptorType = vk::DescriptorType::eCombinedImageSampler;
+            write_infos[1].descriptorCount = 1;
+
+            device.updateDescriptorSets(write_infos, nullptr);
         }
     }
 
